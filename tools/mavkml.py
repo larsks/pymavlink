@@ -1,204 +1,214 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
-'''
-simple kml export for logfiles
-Thomas Gubler <thomasgubler@gmail.com>
-'''
-from __future__ import print_function
-
-from builtins import range
-
-from argparse import ArgumentParser
+import argparse
+import itertools
+import logging
 import simplekml
-from pymavlink.mavextra import *
-from pymavlink import mavutil
-import time
-import re
-import os
+import sys
 
-mainstate_field = 'STAT.MainState'
-position_field_types = [  # Order must be lon, lat, alt to match KML
-  ['Lon', 'Lat', 'Alt'],  # PX4
-  ['Lng', 'Lat', 'Alt']   # APM > 3
+from pymavlink import mavutil
+from pymavlink import mavparser
+from pymavlink.mavutil import mavlink
+
+# This maps MAV_CMD_NAV_ values back to their names.
+MAV_CMD_MAP = {getattr(mavlink, k): k
+               for k in dir(mavlink)
+               if k.startswith('MAV_CMD_NAV_')}
+
+# For additional icon URLs:
+# http://kml4earth.appspot.com/icons.html
+MAV_CMD_SHAPES = {
+    mavlink.MAV_CMD_NAV_WAYPOINT: 'http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png',
+    mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH: 'http://maps.google.com/mapfiles/kml/paddle/red-square.png',
+    mavlink.MAV_CMD_NAV_TAKEOFF: 'http://maps.google.com/mapfiles/kml/paddle/go.png',
+    mavlink.MAV_CMD_NAV_LAND: 'http://maps.google.com/mapfiles/kml/paddle/orange-square.png',
+    mavlink.MAV_CMD_NAV_LOITER_TIME: 'http://maps.google.com/mapfiles/kml/paddle/pause.png',
+    mavlink.MAV_CMD_NAV_LOITER_TO_ALT: 'http://maps.google.com/mapfiles/kml/paddle/pause.png',
+    mavlink.MAV_CMD_NAV_LOITER_TURNS: 'http://maps.google.com/mapfiles/kml/paddle/pause.png',
+    mavlink.MAV_CMD_NAV_LOITER_UNLIM: 'http://maps.google.com/mapfiles/kml/paddle/pause.png',
+}
+
+DEFAULT_POSITION_SOURCE = 'GPS'
+
+COLORS = [
+    simplekml.Color.red,
+    simplekml.Color.blue,
+    simplekml.Color.violet,
+    simplekml.Color.yellow,
+    simplekml.Color.orange,
+    simplekml.Color.burlywood,
+    simplekml.Color.azure,
+    simplekml.Color.lightblue,
+    simplekml.Color.lawngreen,
+    simplekml.Color.indianred,
+    simplekml.Color.hotpink,
+    simplekml.Color.green,
 ]
 
-colors = [simplekml.Color.red, simplekml.Color.green, simplekml.Color.blue,
-          simplekml.Color.violet, simplekml.Color.yellow, simplekml.Color.orange,
-          simplekml.Color.burlywood, simplekml.Color.azure, simplekml.Color.lightblue,
-          simplekml.Color.lawngreen, simplekml.Color.indianred, simplekml.Color.hotpink]
+def coords(msg):
+    return (getattr(msg, 'Lng', getattr(msg, 'Lon', None)),
+            msg.Lat,
+            msg.Alt)
 
-kml = simplekml.Kml()
-kml_linestrings = []
+class MavKML(mavparser.MAVParser):
+    def __init__(self,
+                 source=DEFAULT_POSITION_SOURCE,
+                 mode_map=mavutil.mode_mapping_acm,
+                 extrude_track=False,
+                 extract_waypoints=False,
+                 color_by_mode=False,
+                 **kwargs):
+        super(MavKML, self).__init__(**kwargs)
 
+        self.source = source
+        self.mode_map = mode_map
+        self.extrude_track = extrude_track
+        self.extract_waypoints = extract_waypoints
+        self.color_by_mode = color_by_mode
 
-def add_to_linestring(position_data, kml_linestring):
-    '''add a point to the kml file'''
-    global kml
+        self.modes = {}
+        self.mode_colors = itertools.cycle(COLORS)
+        self.waypoints = set()
+        self.kml = simplekml.Kml()
 
-    # add altitude offset
-    position_data[2] += float(args.aoff)
-    kml_linestring.coords.addcoordinates([position_data])
+        self.register_handler(source, self.handle_position_msg)
+        self.init_seq()
 
+    def parse(self, source):
+        self.cur_trk = None
+        self.cur_mode = None
+        self.cur_trk_color = None
 
-def save_kml(filename):
-    '''saves the kml file'''
-    global kml
-    kml.save(filename)
-    print("KML written to %s" % filename)
+        super(MavKML, self).parse(source)
 
+    def init_seq(self):
+        self.wptid_seq = itertools.count()
+        self.trkid_seq = itertools.count()
 
-def add_data(t, msg, msg_types, vars, fields, field_types, position_field_type):
-    '''add some data'''
+    def new_track(self):
+        trkid = next(self.trkid_seq)
+        self.cur_trk = self.kml.newlinestring(
+            name='TRK{:03d}'.format(trkid),
+            altitudemode='absolute',
+            extrude=self.extrude_track)
 
-    mtype = msg.get_type()
-    if mtype not in msg_types:
-        return
+        if self.color_by_mode:
+            if not self.cur_mode in self.modes:
+                self.modes[self.cur_mode] = next(self.mode_colors)
+            self.cur_trk.linestyle.color = self.modes[self.cur_mode]
 
-    for i in range(0, len(fields)):
-        if mtype not in field_types[i]:
-            continue
-        f = fields[i]
-        v = mavutil.evaluate_expression(f, vars)
-        if v is None:
-            continue
+        if self.cur_trk_color:
+            self.cur_trk.linestyle.color = self.cur_trk_color
 
-        # Check if we have position or state information
-        if f == mainstate_field:
-            # Handle main state information
-            # add_data.mainstate_current >= 0 : avoid starting a new linestring
-            # when mainstate comes after the first position data in the log
-            if (v != add_data.mainstate_current and
-                    add_data.mainstate_current >= 0):
-                add_data.new_linestring = True
-            add_data.mainstate_current = v
-        else:
-            # Handle position information
-            # make sure lon, lat, alt is saved in the correct order in
-            # position_data (the same as in position_field_types)
-            add_data.position_data[i] = v
+        md = simplekml.ExtendedData()
+        md.newdata('mode_id', self.cur_mode)
+        md.newdata('mode_name', self.mode_map.get(self.cur_mode, 'UNKNOWN'))
+        self.cur_trk.extendeddata = md
 
-    # check if we have a full gps measurement
-    gps_measurement_ready = True
-    for v in add_data.position_data:
-        if v is None:
-            gps_measurement_ready = False
-    if not gps_measurement_ready:
-        return
+    def on_MODE(self, msg):
+        '''Close the current track on mode switches'''
 
-    # if new line string is needed (because of state change): add previous
-    # linestring to kml_linestrings list, add a new linestring to the kml
-    # multigeometry and append to the new linestring
-    # else: append to current linestring
-    if add_data.new_linestring:
-        if add_data.current_kml_linestring is not None:
-            kml_linestrings.append(add_data.current_kml_linestring)
+        if msg.Mode != self.cur_mode:
+            self.cur_trk = None
+            self.cur_mode = msg.Mode
 
-        name = "".join([args.source, ":", str(add_data.mainstate_current)])
-        add_data.current_kml_linestring = \
-            kml.newlinestring(name=name, altitudemode='absolute')
+    def handle_position_msg(self, msg):
+        '''Add position information to the current track'''
+        wp = coords(msg)
+        if self.cur_trk is None:
+            self.new_track()
 
-        # set rendering options
-        if args.extrude:
-            add_data.current_kml_linestring.extrude = 1
-        add_data.current_kml_linestring.style.linestyle.color = \
-            colors[max([add_data.mainstate_current, 0])]
+        self.cur_trk.coords.addcoordinates([wp])
 
-        add_data.new_linestring = False
+    def on_CMD(self, msg):
+        '''Extract coordinates from MAV_CMD_NAV_* messages and add them as
+        waypoints to generated KML.'''
 
-        add_to_linestring(add_data.position_data,
-                      add_data.current_kml_linestring)
-        add_data.last_time = msg._timestamp
+        # Abort if we are not trying to extract waypoints.
+        if not self.extract_waypoints:
+            return
 
-    else:
-        if (msg._timestamp - add_data.last_time) > 0.1:
-            add_to_linestring(add_data.position_data,
-                      add_data.current_kml_linestring)
-            add_data.last_time = msg._timestamp
+        # We only care about MAV_CMD_NAV_* commands.
+        if msg.CId not in MAV_CMD_MAP:
+            return
 
-    # reset position_data
-    add_data.position_data = [None for n in position_field_type]
+        wp = coords(msg)
 
+        # Skip this waypoint if we have already logged one at the same
+        # location.
+        if wp in self.waypoints:
+            return
 
-def process_file(filename, source):
-    '''process one file'''
-    print("Processing %s" % filename)
-    mlog = mavutil.mavlink_connection(filename, notimestamps=args.notimestamps)
-    
-    position_field_type = sniff_field_spelling(mlog, source)
-    
-    # init fields and field_types lists
-    fields = [args.source + "." + s for s in position_field_type]
-    fields.append(mainstate_field)
-    field_types = []
+        self.waypoints.add(wp)
+        wptid = next(self.wptid_seq)
 
-    msg_types = set()
-    re_caps = re.compile('[A-Z_][A-Z0-9_]+')
+        md = simplekml.ExtendedData()
+        md.newdata('command_id', msg.CId)
+        md.newdata('command_name', MAV_CMD_MAP.get(msg.CId, 'UNKNOWN'))
+        pnt = self.kml.newpoint(name='WP{:03d}'.format(wptid),
+                                coords=[wp],
+                                altitudemode='absolute',
+                                extendeddata=md)
 
-    for f in fields:
-        caps = set(re.findall(re_caps, f))
-        msg_types = msg_types.union(caps)
-        field_types.append(caps)
-    
-    add_data.new_linestring = True
-    add_data.mainstate_current = -1
-    add_data.current_kml_linestring = None
-    add_data.position_data = [None for n in position_field_type]
-    add_data.last_time = 0
+        if msg.CId in MAV_CMD_SHAPES:
+            style = simplekml.Style()
+            style.iconstyle.icon.href = MAV_CMD_SHAPES[msg.CId]
+            pnt.style = style
 
-    while True:
-        msg = mlog.recv_match(args.condition)
-        if msg is None:
-            break
-        tdays = (msg._timestamp - time.timezone) / (24 * 60 * 60)
-        tdays += 719163  # pylab wants it since 0001-01-01
-        add_data(tdays, msg, msg_types, mlog.messages, fields, field_types, position_field_type)
-        
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--source', '-s',
+                   default=DEFAULT_POSITION_SOURCE,
+                   help=(
+                       'Message type for position information '
+                       '(defaults to {})'.format(DEFAULT_POSITION_SOURCE)))
+    p.add_argument('--output', '-o',
+                   help='Output KML to named file (defaults to stdout)')
 
-def sniff_field_spelling(mlog, source):
-    '''attempt to detect whether APM or PX4 attributes names are in use'''
-    position_field_type_default = position_field_types[0] # Default to PX4 spelling
-    
-    msg = mlog.recv_match(source)
-    mlog._rewind() # Unfortunately it's either call this or return a mutated object
-    
-    position_field_selection = [spelling for spelling in position_field_types if hasattr(msg, spelling[0])]
+    g = p.add_argument_group('Filtering options')
+    g.add_argument('--condition', '-c',
+                   help='Filter mavlink messages on CONDITION')
+    g.add_argument('--waypoints', '-w',
+                   action='store_true',
+                   help='Extract waypoints from log')
 
-    return position_field_selection[0] if position_field_selection else position_field_type_default
+    g = p.add_argument_group('Display options')
+    g.add_argument('--color-by-mode', '-k',
+                   action='store_true',
+                   help='Color tracks by mode')
+    g.add_argument('--extrude', '-e',
+                   action='store_true',
+                   help='Extend tracks to ground')
 
+    g = p.add_argument_group('Logging options')
+    g.add_argument('--quiet', '-q',
+                   action='store_const',
+                   const='WARNING',
+                   dest='loglevel')
+    g.add_argument('--debug', '-d',
+                   action='store_const',
+                   const='DEBUG',
+                   dest='loglevel')
+
+    p.set_defaults(loglevel='INFO')
+
+    p.add_argument('logfile', nargs='*')
+
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=args.loglevel)
+    p = MavKML(condition=args.condition,
+               extrude_track=args.extrude,
+               extract_waypoints=args.waypoints,
+               color_by_mode=args.color_by_mode)
+
+    for logfile in args.logfile:
+        p.parse(logfile)
+
+    with open(args.output, 'w') if args.output else sys.stdout as fd:
+        fd.write(p.kml.kml())
 
 if __name__ == '__main__':
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--no-timestamps", dest="notimestamps",
-                      action='store_true', help="Log doesn't have timestamps")
-    parser.add_argument("--condition", default=None,
-                      help="select packets by a condition [default: %(default)s]")
-    parser.add_argument("--aoff", default=0.,
-                      help="Altitude offset for paths that go through the"
-                      "ground in google earth [default: %(default)s]")
-    parser.add_argument("-o", "--output", dest="filename_out", default="mav.kml",
-                      help="Output filename [default: %(default)s] ")
-    parser.add_argument("-s", "--source", default="GPOS",
-                      help="Select position data source"
-                      "(GPOS or GPS) [default: %(default)s]")
-    parser.add_argument("-e", "--extrude", default=False,
-                      action='store_true',
-                      help="Extrude paths to ground [default: %(default)s]")
-    parser.add_argument("logs", metavar="LOG", nargs="+")
-
-    args = parser.parse_args()
-
-    filenames = []
-    for f in args.logs:
-        if os.path.exists(f):
-            filenames.append(f)
-
-    if len(filenames) == 0:
-        print("No files to process")
-        sys.exit(1)
-
-    for fi in range(0, len(filenames)):
-        f = filenames[fi]
-        process_file(f, args.source)
-
-    save_kml(args.filename_out)
-
+    main()
